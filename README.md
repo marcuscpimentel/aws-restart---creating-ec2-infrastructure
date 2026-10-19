@@ -1,194 +1,241 @@
-# EC2 com Terraform
+# Introduction to Amazon EC2
 
-Implementação de um servidor Apache no EC2, a partir dos conceitos do laboratório de introdução ao EC2 que estou estudando no AWS re/Start.
+No contexto do programa AWS re/Start, oferecido pela parceria entre a AWS e a Escola da Nuvem, realizei o laboratório **Introduction to Amazon EC2**, com criação, monitoramento e redimensionamento de uma instância.
 
-A proposta é acompanhar o ciclo da instância: criar com HTTP bloqueado, liberar a página, aumentar a capacidade e preparar a remoção. Cada estado está em um arquivo de variáveis. O Terraform cuida da infraestrutura; os testes verificam as configurações e o serviço publicado.
+Fiz o laboratório primeiro pelo console da AWS. Depois, escrevi a infraestrutura em Terraform e preparei os testes para conferir as configurações e o funcionamento do servidor web.
 
-## O que o projeto cria
+Abaixo estão as etapas do exercício e os principais trechos da implementação. As referências a variáveis e outros recursos fazem parte dos arquivos deste repositório; os blocos não são arquivos independentes.
 
-- Uma EC2 com Amazon Linux 2023 x86_64 e Apache instalado por user data.
-- Um EBS raiz gp3 criptografado, removido junto com a instância.
-- Um Security Group sem SSH. A porta 80 começa fechada.
-- Uma VPC com sub-rede pública, Internet Gateway e rota para a internet, caso nenhuma sub-rede existente seja informada.
+## Configurações gerais da instância
 
-O tráfego HTTP chega pelo IPv4 público da EC2, passa pelo Security Group e é atendido pelo Apache. A saída para a internet fica liberada para instalar os pacotes. Não há Load Balancer, NAT Gateway, HTTPS ou Elastic IP neste projeto.
+O laboratório começa com a criação de uma instância para hospedar uma página web. A configuração inicial usa:
 
-Mantive o monitoramento básico do EC2. O modo de créditos da T3 é `standard`, e o acesso aos metadados exige IMDSv2. Não há par de chaves nem perfil IAM na instância.
+- Amazon Linux 2023;
+- instância `t3.micro`;
+- volume raiz de 8 GiB;
+- sub-rede da Lab VPC;
+- nenhum par de chaves para SSH;
+- proteção contra término habilitada.
 
-## Arquivos
+No Terraform, a instância é definida pelo recurso `aws_instance`. Este é o trecho com as configurações principais:
 
-| Caminho | Uso |
-| --- | --- |
-| `main.tf` | AMI, EC2 e Security Group |
-| `network.tf` | Rede própria ou referência à sub-rede existente |
-| `variables.tf` / `outputs.tf` | Entradas e saídas do projeto |
-| `versions.tf` / `.terraform.lock.hcl` | Restrições de versão e versão selecionada do provider |
-| `scripts/user-data.sh` | Instalação do Apache e criação da página |
-| `scenarios/` | Estados do laboratório |
-| `tests/lab.tftest.hcl` | Testes de configuração com provider simulado |
-| `tests/integration.py` | Verificação da implantação real pela API e por HTTP |
-| `.github/workflows/checks.yml` | Verificações automáticas no GitHub, sem credenciais AWS |
+```hcl
+resource "aws_instance" "web" {
+  ami                         = var.ami_id != null ? var.ami_id : nonsensitive(data.aws_ssm_parameter.al2023[0].value)
+  instance_type               = var.instance_type
+  subnet_id                   = local.subnet_id
+  vpc_security_group_ids      = [aws_security_group.web.id]
+  associate_public_ip_address = true
+  disable_api_termination     = var.termination_protection
+  monitoring                  = false
+  user_data                   = file("${path.module}/scripts/user-data.sh")
+  user_data_replace_on_change = true
 
-## Antes de executar
-
-São necessários Terraform 1.7 ou superior, abaixo da versão 2, e credenciais AWS válidas no ambiente. Os testes de integração também usam Python 3.10+ e boto3. Os comandos abaixo consideram Bash; no Windows, podem ser executados pelo WSL.
-
-```bash
-cp terraform.tfvars.example terraform.tfvars
-terraform init
+  root_block_device {
+    volume_type           = "gp3"
+    volume_size           = var.root_volume_size
+    encrypted             = true
+    delete_on_termination = true
+  }
+}
 ```
 
-Revise `aws_region` no `terraform.tfvars`. O padrão é `us-east-1`. As credenciais devem vir de um perfil AWS, sessão de SSO ou variáveis de ambiente; não entram nos arquivos Terraform. O provider e o boto3 precisam usar a mesma conta e região.
+O tipo da máquina, o tamanho do disco e a proteção contra término vêm de variáveis. Na primeira etapa, os valores são:
 
-Para usar a rede do ambiente do curso, preencha `existing_subnet_id` com uma sub-rede pública da Lab VPC e use a região do laboratório. Nesse modo, o Terraform só cria a EC2 e o Security Group. A rota para o Internet Gateway, o DNS e as regras de NACL da rede existente precisam estar configurados. O projeto não altera essa rede.
-
-Contas de treinamento podem restringir o uso do Terraform, consultas ao SSM ou a criação de recursos. Informar a sub-rede existente não contorna essas permissões. Se necessário, `ami_id` permite informar uma AMI Amazon Linux 2023 x86_64 da mesma região sem consultar o parâmetro público.
-
-## Estados do laboratório
-
-| Arquivo | EC2 | EBS | HTTP | Proteção contra término |
-| --- | --- | --- | --- | --- |
-| `01-initial.tfvars` | t3.micro | 8 GiB | Bloqueado | Ativa |
-| `02-http.tfvars` | t3.micro | 8 GiB | Liberado | Ativa |
-| `03-resized.tfvars` | t3.small | 10 GiB | Liberado | Ativa |
-| `04-cleanup.tfvars` | t3.small | 10 GiB | Liberado | Desativada |
-
-Para criar a primeira etapa:
-
-```bash
-terraform plan -var-file=scenarios/01-initial.tfvars -out=initial.tfplan
-terraform apply initial.tfplan
+```hcl
+instance_type          = "t3.micro"
+root_volume_size       = 8
+allow_http             = false
+termination_protection = true
 ```
 
-Os outros estados usam o mesmo diretório, workspace e state. Por exemplo, para liberar o HTTP e depois redimensionar:
+O atributo `associate_public_ip_address` solicita um IPv4 público para a instância. Já `vpc_security_group_ids` associa o Security Group que controla o acesso ao servidor.
+
+No volume raiz, o código especifica `gp3`, criptografia e exclusão do disco junto com o término da EC2. A ausência de `key_name` corresponde ao exercício, que não exige login por SSH.
+
+No console, a rede já estava disponível na Lab VPC. Para usar uma rede existente na versão Terraform, o projeto recebe o ID da sub-rede em `existing_subnet_id`. Quando essa variável não é informada, ele cria uma VPC e uma sub-rede pública, com Internet Gateway e rota de saída.
+
+## Instalação e inicialização do servidor web
+
+A instalação do Apache é feita pelo user data, executado na primeira inicialização da instância. No projeto, deixei esse script em `scripts/user-data.sh`:
 
 ```bash
-terraform plan -var-file=scenarios/02-http.tfvars -out=http.tfplan
-terraform apply http.tfplan
+#!/usr/bin/env bash
+set -euo pipefail
 
+dnf install -y httpd
+
+cat > /var/www/html/index.html <<'HTML'
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EC2 Lab</title>
+  </head>
+  <body>
+    <h1>Servidor EC2 em funcionamento</h1>
+    <p id="lab-marker">ec2-lab-ready</p>
+    <p>Amazon Linux 2023, Apache e Terraform.</p>
+  </body>
+</html>
+HTML
+
+chmod 0644 /var/www/html/index.html
+systemctl enable --now httpd
+```
+
+O `dnf` instala o pacote `httpd`. Em seguida, o script cria a página no diretório servido pelo Apache. O comando `systemctl enable --now httpd` inicia o serviço e o habilita para as próximas inicializações.
+
+A linha `user_data = file(...)`, na configuração da EC2, lê esse arquivo e envia seu conteúdo para a instância. O marcador `ec2-lab-ready` na página é usado depois no teste HTTP para conferir o conteúdo retornado.
+
+## Monitoramento da instância
+
+Depois da criação, o laboratório pede a verificação dos status checks e das métricas de monitoramento no console.
+
+Os status checks ajudam a identificar problemas na infraestrutura que sustenta a EC2 e na própria instância. No CloudWatch, é possível acompanhar métricas como utilização de CPU e tráfego de rede.
+
+Na implementação, mantive o monitoramento básico:
+
+```hcl
+monitoring = false
+```
+
+No recurso `aws_instance`, esse atributo controla o monitoramento **detalhado**. Portanto, `false` mantém o monitoramento básico, com métricas em intervalos de cinco minutos. O detalhado utiliza intervalos de um minuto.
+
+Os testes de integração também aguardam a aprovação dos status checks. A consulta aos pontos de CPU no CloudWatch ficou como uma verificação opcional, porque essas métricas podem levar alguns minutos para aparecer.
+
+## Alteração do Security Group para liberar HTTP
+
+Na configuração inicial, o Security Group não possui regras de entrada. Por isso, o acesso à página pela porta 80 fica bloqueado, mesmo com a instância em execução.
+
+No console, essa etapa consiste em adicionar uma regra de entrada para HTTP, permitindo conexões de qualquer endereço IPv4. No Terraform, a regra depende de `allow_http`:
+
+```hcl
+ingress = var.allow_http ? [{
+  description      = "HTTP"
+  from_port        = 80
+  to_port          = 80
+  protocol         = "tcp"
+  cidr_blocks      = [var.http_cidr]
+  ipv6_cidr_blocks = []
+  prefix_list_ids  = []
+  security_groups  = []
+  self             = false
+}] : []
+```
+
+Esse trecho fica dentro de `aws_security_group.web`. Quando `allow_http` é `false`, a lista de regras de entrada fica vazia. Quando passa para `true`, o Terraform configura a entrada TCP na porta 80.
+
+A origem vem de `http_cidr`, cujo valor padrão é `0.0.0.0/0`, reproduzindo a liberação pública do exercício. O acesso SSH continua sem regra de entrada.
+
+O arquivo `scenarios/02-http.tfvars` altera `allow_http` para `true`, mantendo o tipo da instância, o tamanho do disco e a proteção contra término. Depois de aplicar essa etapa e aguardar a instalação do Apache, o endereço pode ser consultado com:
+
+```bash
+terraform output -raw web_url
+```
+
+## Alteração do tipo da instância e do volume EBS
+
+A etapa seguinte aumenta a capacidade da EC2 e o tamanho do disco:
+
+| Recurso | Configuração inicial | Após a alteração |
+| --- | --- | --- |
+| Instância | t3.micro | t3.small |
+| Memória | 1 GiB | 2 GiB |
+| Volume raiz | 8 GiB | 10 GiB |
+
+Pelo console, o procedimento envolve parar a instância, alterar seu tipo, aumentar o volume e iniciar a máquina novamente.
+
+Na versão Terraform, os novos valores ficam em `scenarios/03-resized.tfvars`:
+
+```hcl
+instance_type          = "t3.small"
+root_volume_size       = 10
+allow_http             = true
+termination_protection = true
+```
+
+Essas variáveis alimentam `instance_type` e `root_block_device.volume_size` no recurso da EC2. Para revisar e aplicar a mudança:
+
+```bash
 terraform plan -var-file=scenarios/03-resized.tfvars -out=resized.tfplan
 terraform apply resized.tfplan
 ```
 
-O resize deve atualizar a EC2 existente. A mudança de tipo envolve stop/start e interrompe o serviço. Revise o plano antes de aplicar: uma substituição da instância não é o resultado esperado para essa mudança. A proteção contra término não impede a parada.
+A alteração do tipo envolve stop/start, com interrupção do serviço. O plano deve indicar a atualização da instância existente para essa mudança. Como o IPv4 público pode mudar quando a máquina volta, é necessário consultar a saída `web_url` novamente.
 
-O IPv4 público pode mudar no stop/start. Consulte `terraform output -raw web_url` novamente após o resize. O user data roda na primeira inicialização, e o Apache fica habilitado para voltar no boot seguinte.
+O teste do volume verifica se a AWS informa 10 GiB para o EBS. A expansão da partição e do sistema de arquivos dentro da instância exige uma verificação própria e ficou fora do escopo desse teste.
 
-O volume aumenta de 8 para 10 GiB, mas isso não comprova que a partição e o sistema de arquivos passaram a usar todo o espaço. Este projeto verifica o tamanho do EBS pela API; a expansão dentro do sistema operacional fica fora desse teste. Também não é possível reduzir o EBS existente de volta para 8 GiB. Para repetir a sequência desde o início, remova e recrie os recursos.
+## Proteção contra término e remoção dos recursos
 
-A AMI é descoberta pelo parâmetro público do Amazon Linux na criação. Mudanças posteriores no atributo `ami` são ignoradas para que uma nova versão publicada pela AWS não substitua a instância durante o exercício. Isso também vale para uma alteração posterior em `ami_id`. Uma troca de imagem exige uma substituição explícita, com a proteção desativada antes.
+A proteção contra término é habilitada desde a criação. No console, o laboratório inclui uma tentativa de terminar a instância com essa proteção ativa, seguida da desativação para permitir sua exclusão.
 
-## Testes
+No Terraform, o atributo correspondente é:
 
-### Configuração, sem conta AWS
-
-```bash
-terraform fmt -check -recursive
-terraform validate
-terraform test
+```hcl
+disable_api_termination = var.termination_protection
 ```
 
-O arquivo `tests/lab.tftest.hcl` usa `mock_provider "aws"` e execuções com `command = plan`. Os testes não chamam as APIs da AWS nem criam recursos. O `init` ainda precisa baixar o provider.
+Com `termination_protection = true`, o EC2 bloqueia o término pela API. Essa proteção permite a parada da instância, necessária durante a alteração de tipo.
 
-São 11 cenários: estado inicial, HTTP público, HTTP restrito a um IP, resize, preparação da remoção, reutilização de sub-rede, AMI explícita e quatro entradas inválidas. Entre as verificações estão a ausência de regras de entrada na primeira etapa, a liberação exclusiva da porta 80, a proteção contra término, a criptografia do EBS e a exigência de IMDSv2.
+Para preparar a remoção depois do resize, o arquivo `scenarios/04-cleanup.tfvars` mantém as configurações da máquina e desativa a proteção:
 
-Esses testes verificam o plano e as regras do projeto. Não comprovam que a AWS aceitou a implantação ou que o Apache iniciou.
-
-Também há três testes locais para o verificador HTTP: uma resposta correta, uma página diferente com status 200 e uma resposta 500 que contém o marcador esperado. Depois de instalar `requirements-test.txt`, execute:
-
-```bash
-python -m unittest discover -s tests -p 'test_http_probe.py' -v
+```hcl
+instance_type          = "t3.small"
+root_volume_size       = 10
+allow_http             = true
+termination_protection = false
 ```
 
-O workflow `Checks` executa a validação, os cenários simulados, a checagem de sintaxe do bootstrap e os testes locais de HTTP em pushes e pull requests. Ele não faz `apply` na AWS. Isso considera que os arquivos deste projeto estão na raiz do repositório.
-
-### Integração, com os recursos na AWS
-
-Depois de aplicar uma etapa, gere as saídas e execute o teste correspondente:
+A mudança precisa ser aplicada antes da remoção:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-test.txt
-
-terraform output -json > terraform-outputs.json
-python tests/integration.py --stage initial
+terraform apply -var-file=scenarios/04-cleanup.tfvars
+terraform destroy -var-file=scenarios/04-cleanup.tfvars
 ```
 
-Nas etapas seguintes, atualize o arquivo de saídas antes de testar:
+O primeiro comando atualiza o atributo na EC2. O segundo remove os recursos gerenciados pelo projeto. Quando uma sub-rede existente é utilizada, a rede fornecida fica fora da remoção.
+
+## Testes da implementação
+
+Além da infraestrutura, preparei testes para verificar as configurações previstas em cada etapa e consultar os recursos após uma implantação.
+
+Os testes nativos do Terraform usam um provider AWS simulado. Um dos cenários verifica os parâmetros do resize:
+
+```hcl
+run "resized_state" {
+  command = plan
+
+  variables {
+    allow_http       = true
+    instance_type    = "t3.small"
+    root_volume_size = 10
+  }
+
+  assert {
+    condition = (
+      aws_instance.web.instance_type == "t3.small" &&
+      aws_instance.web.root_block_device[0].volume_size == 10
+    )
+    error_message = "A etapa de resize deve usar t3.small e EBS de 10 GiB."
+  }
+}
+```
+
+O bloco define as entradas desse cenário e confere os valores no plano. Ele faz parte de `tests/lab.tftest.hcl`, que contém a configuração do provider simulado e os outros cenários. A execução é feita com `terraform test`, sem criar recursos na AWS.
+
+Já `tests/integration.py` consulta a conta AWS para verificar o tipo e o estado da instância, o EBS, as regras do Security Group e a proteção contra término. Nas etapas com HTTP liberado, também exige uma resposta 200 contendo o marcador da página.
+
+Depois de aplicar a etapa de resize, por exemplo, a execução usa:
 
 ```bash
-terraform output -json > terraform-outputs.json
-python tests/integration.py --stage http
-
-# Após aplicar 03-resized.tfvars:
 terraform output -json > terraform-outputs.json
 python tests/integration.py --stage resized
 ```
 
-O argumento `--stage` define os resultados esperados independentemente das saídas do Terraform. O arquivo de saídas fornece os identificadores e a região; os valores reais são consultados na AWS.
+O arquivo de saídas fornece os identificadores dos recursos. O argumento `--stage resized` define os valores esperados para essa etapa. Esse teste consulta a proteção contra término pelo atributo da instância, sem executar uma tentativa de exclusão.
 
-| Verificação | O que é conferido |
-| --- | --- |
-| EC2 | Status checks, estado running, tipo, sub-rede, VPC, IP e associação exclusiva ao Security Group do projeto |
-| EBS | Tamanho esperado, gp3, criptografia, vínculo com a EC2 e exclusão no término |
-| Rede | Nenhuma entrada na etapa inicial; nas demais, somente TCP 80 para o CIDR informado |
-| Proteção | Valor real de `DisableApiTermination` |
-| Metadados e monitoramento | IMDSv2 obrigatório e monitoramento detalhado desativado |
-| Serviço | Conexão bloqueada na etapa inicial; depois, HTTP 200 com o marcador da página do projeto |
-| CloudWatch, opcional | Presença de pontos de CPUUtilization nos últimos 30 minutos |
+Nesta versão, passaram as verificações de formatação, sintaxe e os três testes locais do verificador HTTP. A validação completa do Terraform ficou bloqueada por uma restrição de sockets do ambiente utilizado, e os testes de integração contra a AWS ainda precisam ser executados.
 
-O teste de proteção consulta o atributo; ele não tenta terminar a instância. A falha de conexão na primeira etapa é uma evidência complementar à leitura das regras do Security Group, não um diagnóstico isolado de firewall.
-
-O teste espera os status checks por até 600 segundos e, nas etapas com HTTP, espera a página por até mais 600 segundos. É possível ajustar esse prazo com `--timeout`. Um erro retorna código de saída diferente de zero. Os testes não criam, alteram ou removem recursos.
-
-Para incluir a consulta de métricas:
-
-```bash
-python tests/integration.py --stage resized --check-metrics
-```
-
-Métricas básicas têm intervalo de cinco minutos e podem demorar a aparecer. Sem essa opção, o teste de pontos de CPU aparece como ignorado. Se ela for usada e ainda não houver pontos, o teste falha e informa que é preciso aguardar. Ler métricas pela API pode ter custo.
-
-Se mudar `http_cidr`, execute o teste a partir de um endereço permitido e passe o mesmo CIDR em `--http-cidr`. Os testes reais precisam de `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus`, `ec2:DescribeSecurityGroups`, `ec2:DescribeVolumes` e `ec2:DescribeInstanceAttribute`. A consulta opcional usa `cloudwatch:GetMetricStatistics`. Essas são permissões dos testes, não a lista de permissões para provisionar a infraestrutura.
-
-### Verificação desta entrega
-
-A validação local e os cenários simulados são registrados em `VALIDATION.md`. Os testes de integração precisam ser executados após uma implantação em conta AWS. Nenhum resultado de implantação real é presumido aqui.
-
-## Remoção
-
-Se passou pela sequência até o resize, aplique o quarto estado e então remova:
-
-```bash
-terraform plan -var-file=scenarios/04-cleanup.tfvars -out=cleanup.tfplan
-terraform apply cleanup.tfplan
-terraform output -json > terraform-outputs.json
-python tests/integration.py --stage cleanup-ready
-terraform destroy -var-file=scenarios/04-cleanup.tfvars
-```
-
-Se parou antes do resize, não use o quarto estado, pois ele também muda o tipo e o disco. Desative a proteção mantendo o estado em que parou. Exemplo para a primeira etapa:
-
-```bash
-terraform apply -var-file=scenarios/01-initial.tfvars -var='termination_protection=false'
-terraform destroy -var-file=scenarios/01-initial.tfvars -var='termination_protection=false'
-```
-
-Para a segunda etapa, use `02-http.tfvars` nos dois comandos. A desativação precisa ser aplicada antes do `destroy`; passar a variável apenas no comando de remoção não atualiza o atributo da EC2. A configuração não usa `force_destroy`.
-
-## Limites e custos
-
-Este é um servidor de estudo em uma única zona de disponibilidade. O HTTP é sem criptografia, e a origem padrão é `0.0.0.0/0`, como no exercício. A configuração não é uma arquitetura de produção.
-
-EC2, EBS, IPv4 público e transferência de dados podem gerar cobrança. Não há garantia de gratuidade por usar `t3.micro`. Parar a instância não remove os custos de armazenamento. Ao terminar, confira se o `destroy` foi concluído.
-
-O state fica local e precisa ser preservado até a remoção. Não publique state, credenciais, planos ou o arquivo de saídas. O `.gitignore` exclui esses arquivos; os cenários públicos e o lock do provider devem ser versionados.
-
-## Referências
-
-- [Testes do Terraform](https://developer.hashicorp.com/terraform/language/tests)
-- [Provider simulado nos testes](https://developer.hashicorp.com/terraform/language/tests/mocking)
-- [Recurso aws_instance](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance)
-- [Proteção contra término no EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_ChangingDisableAPITermination.html)
-- [Expansão do sistema de arquivos após aumentar o EBS](https://docs.aws.amazon.com/ebs/latest/userguide/recognize-expanded-volume-linux.html)
+Os comandos de preparação, execução das etapas e instalação das dependências dos testes estão em [docs/usage.md](docs/usage.md). Os resultados das verificações desta versão estão em [VALIDATION.md](VALIDATION.md).
